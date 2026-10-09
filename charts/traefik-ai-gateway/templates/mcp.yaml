@@ -1,0 +1,328 @@
+# MCP gateway: same JWT and TBAC policies as the upstream demo, on the same host
+# as the chat API:
+#   https://ai.<domain>/mcp/ai-factory  -> self-hosted ops MCP server
+#   https://ai.<domain>/mcp/deepwiki    -> external DeepWiki MCP server
+# Callers: Open WebUI (each user's own token via auth_type system_oauth),
+# Claude Code, the MCP Inspector, and scripts/agent.sh.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: agentic-jwt
+  labels:
+    {{- include "tag.labels" . | nindent 4 }}
+spec:
+  plugin:
+    jwt:
+      trustedIssuers:
+        - issuer: {{ include "tag.kcIssuer" . }}
+          jwksUrl: {{ include "tag.kcJwks" . }}
+      forwardHeaders:
+        X-User: sub
+        X-Groups: groups
+      # The MCP servers do not verify tokens; the gateway is the policy
+      # decision point, so the Authorization header is not forwarded upstream.
+      forwardAuthorization: false
+      usernameClaim: sub
+---
+# Ops server TBAC: read tools for everyone, privileged tools for admins only.
+# listPolicies hide the privileged tools from a developer's tools/list, and
+# the call policies deny them even if called directly.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: mcp-policy
+  labels:
+    {{- include "tag.labels" . | nindent 4 }}
+spec:
+  plugin:
+    mcp:
+      policies:
+        - action: allow
+          match: >-
+            Equals(`mcp.method`, `initialize`) ||
+            Equals(`mcp.method`, `notifications/initialized`) ||
+            Equals(`mcp.method`, `tools/list`) ||
+            Equals(`mcp.method`, `ping`)
+        - action: allow
+          match: >-
+            Equals(`mcp.params.name`, `list_models`) ||
+            Equals(`mcp.params.name`, `get_gpu_inventory`) ||
+            Equals(`mcp.params.name`, `get_model_quota`)
+        - action: allow
+          match: >-
+            (Equals(`mcp.params.name`, `restart_model`) ||
+             Equals(`mcp.params.name`, `set_model_quota`)) &&
+            Contains(`jwt.groups`, `admins`)
+      defaultAction: deny
+      listPolicies:
+        - action: show
+          match: >-
+            Equals(`mcp.params.name`, `list_models`) ||
+            Equals(`mcp.params.name`, `get_gpu_inventory`) ||
+            Equals(`mcp.params.name`, `get_model_quota`)
+        - action: show
+          match: >-
+            (Equals(`mcp.params.name`, `restart_model`) ||
+             Equals(`mcp.params.name`, `set_model_quota`)) &&
+            Contains(`jwt.groups`, `admins`)
+      listDefaultAction: hide
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: agentic-strip
+  labels:
+    {{- include "tag.labels" . | nindent 4 }}
+spec:
+  stripPrefix:
+    prefixes:
+      - /mcp/ai-factory
+---
+# The in-cluster MCP Inspector connects from the browser, so it needs CORS.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: agentic-cors
+  labels:
+    {{- include "tag.labels" . | nindent 4 }}
+spec:
+  headers:
+    accessControlAllowMethods:
+      - GET
+      - OPTIONS
+      - POST
+    accessControlAllowHeaders:
+      - "*"
+    accessControlAllowOriginList:
+      - https://{{ include "tag.inspectorHost" . }}
+    accessControlExposeHeaders:
+      - "*"
+    accessControlMaxAge: 100
+    addVaryHeader: true
+---
+{{- if .Values.deepwiki.enabled }}
+# DeepWiki TBAC: tool visibility by group, plus per-repo scoping by variable
+# substitution against the Keycloak `repos` claim.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: deepwiki-mcp-policy
+  labels:
+    {{- include "tag.labels" . | nindent 4 }}
+spec:
+  plugin:
+    mcp:
+      listPolicies:
+        - action: show
+          match: Prefix(`mcp.params.name`, `read_`) && Contains(`jwt.groups`, `admins`)
+        - action: show
+          match: Equals(`mcp.params.name`, `read_wiki_structure`) && Contains(`jwt.groups`, `developers`)
+      listDefaultAction: hide
+      policies:
+        - action: allow
+          match: >-
+            Equals(`mcp.method`, `initialize`) ||
+            Equals(`mcp.method`, `notifications/initialized`) ||
+            Equals(`mcp.method`, `tools/list`) ||
+            Equals(`mcp.method`, `ping`)
+        - action: deny
+          match: Equals(`mcp.method`, `tools/call`) && !Contains(`jwt.repos`, `${mcp.params.arguments.repoName}`)
+        - action: allow
+          match: Equals(`mcp.method`, `tools/call`) && Equals(`mcp.params.name`, `read_wiki_structure`)
+        - action: allow
+          match: Equals(`mcp.method`, `tools/call`) && Equals(`mcp.params.name`, `read_wiki_contents`) && Contains(`jwt.groups`, `admins`)
+      defaultAction: deny
+      statusCodeOnDeny: 200
+{{- end }}
+---
+{{- if .Values.deepwiki.enabled }}
+# DeepWiki serves MCP at /mcp, so rewrite /mcp/deepwiki -> /mcp.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: deepwiki-strip
+  labels:
+    {{- include "tag.labels" . | nindent 4 }}
+spec:
+  replacePathRegex:
+    regex: ^/mcp/deepwiki(.*)
+    replacement: /mcp$1
+{{- end }}
+---
+{{- if .Values.deepwiki.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: deepwiki-mcp-server
+  labels:
+    {{- include "tag.labels" . | nindent 4 }}
+spec:
+  type: ExternalName
+  externalName: mcp.deepwiki.com
+  ports:
+    - name: https
+      port: 443
+      protocol: TCP
+{{- end }}
+{{- if .Values.mcpRateLimit.enabled }}
+---
+# Requests per user (X-User, set by agentic-jwt) on both MCP servers, counted
+# in the gateway's Redis so the limit holds across Traefik replicas.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: mcp-rate-limit
+  labels:
+    {{- include "tag.labels" . | nindent 4 }}
+spec:
+  plugin:
+    distributedRateLimit:
+      limit: {{ .Values.mcpRateLimit.limit }}
+      period: {{ .Values.mcpRateLimit.period }}
+      burst: {{ .Values.mcpRateLimit.burst }}
+      responseHeaders: true
+      sourceCriterion:
+        requestHeaderName: X-User
+      store:
+        redis:
+          endpoints:
+            - {{ include "tag.svc" (list . "redis") }}
+          password: urn:k8s:secret:redis-auth:password
+          timeout: 500ms
+{{- end }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: mcp
+  labels:
+    {{- include "tag.labels" . | nindent 4 }}
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - kind: Rule
+      match: Host(`{{ include "tag.aiHost" . }}`) && PathPrefix(`/mcp/ai-factory`)
+      middlewares:
+        - name: agentic-cors
+        - name: sanitize-identity
+        - name: agentic-jwt
+        {{- if .Values.mcpRateLimit.enabled }}
+        - name: mcp-rate-limit
+        {{- end }}
+        - name: mcp-policy
+        - name: agentic-strip
+      services:
+        - name: ai-factory-mcp
+          port: 8080
+    {{- if .Values.deepwiki.enabled }}
+    - kind: Rule
+      match: Host(`{{ include "tag.aiHost" . }}`) && PathPrefix(`/mcp/deepwiki`)
+      middlewares:
+        - name: agentic-cors
+        - name: sanitize-identity
+        - name: agentic-jwt
+        {{- if .Values.mcpRateLimit.enabled }}
+        - name: mcp-rate-limit
+        {{- end }}
+        - name: deepwiki-mcp-policy
+        - name: deepwiki-strip
+      services:
+        - name: deepwiki-mcp-server
+          port: 443
+          scheme: https
+          passHostHeader: false
+    {{- end }}
+  tls:
+    secretName: demo-tls
+---
+{{- if .Values.inspector.enabled }}
+# In-cluster MCP Inspector at https://{{ include "tag.inspectorHost" . }}. The browser connects
+# "Direct" to the MCP gateway with a bearer token typed into the UI.
+# DANGEROUSLY_OMIT_AUTH disables the Inspector's own token gate; it only ever
+# talks to the gateway, which enforces auth, but do not leave it up unattended.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-inspector
+  labels:
+    {{- include "tag.labels" . | nindent 4 }}
+  labels:
+    app: mcp-inspector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mcp-inspector
+  template:
+    metadata:
+      labels:
+        app: mcp-inspector
+    spec:
+      containers:
+        - name: inspector
+          image: {{ .Values.inspector.image }}
+          env:
+            - name: HOST
+              value: "0.0.0.0"
+            - name: MCP_AUTO_OPEN_ENABLED
+              value: "false"
+            - name: DANGEROUSLY_OMIT_AUTH
+              value: "true"
+          ports:
+            - name: ui
+              containerPort: 6274
+          readinessProbe:
+            tcpSocket:
+              port: 6274
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+{{- end }}
+---
+{{- if .Values.inspector.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-inspector
+  labels:
+    {{- include "tag.labels" . | nindent 4 }}
+spec:
+  selector:
+    app: mcp-inspector
+  ports:
+    - name: ui
+      port: 6274
+      targetPort: 6274
+{{- end }}
+---
+{{- if .Values.inspector.enabled }}
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: mcp-inspector
+  labels:
+    {{- include "tag.labels" . | nindent 4 }}
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - kind: Rule
+      match: Host(`{{ include "tag.inspectorHost" . }}`)
+      {{- if .Values.waf.enabled }}
+      middlewares:
+        - name: waf
+      {{- end }}
+      services:
+        - name: mcp-inspector
+          port: 6274
+          passHostHeader: false
+  tls:
+    secretName: demo-tls
+
+{{- end }}

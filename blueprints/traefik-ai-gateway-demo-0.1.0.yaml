@@ -1,0 +1,398 @@
+# SUSE AI Factory blueprint: Traefik AI Gateway + MCP Gateway in front of the
+# SUSE AI stack. Every component installs into the AIWorkload's target
+# namespace (traefik-ai-gateway-demo-system recommended, see cluster/traefik-helmchart.yaml).
+#
+# Release names and fullnameOverrides are pinned so the services get stable
+# names (ollama, vllm-router-service, milvus, redis, open-webui,
+# otel-collector) that the traefik-ai-gateway chart's backends.* defaults expect.
+#
+# Per-install values to set in the install wizard:
+#   traefik-ai-gateway       domain (and vllmModel if you change it); tls.acmeEmail optional
+#   vllm                     servingEngineSpec.modelSpec[0].modelURL (must equal vllmModel)
+#   opentelemetry-collector  suseObservability.endpoint / .clusterName / .apiKey
+#   suse-ai-observability-extension  serverUrl, apiToken, kubernetesClusters
+# Disable the two observability components if you have no SUSE Observability.
+#
+# The operator injects the Application Collection pull secret
+# (global.imagePullSecrets) into every component, so none is listed here.
+apiVersion: ai-factory.suse.com/v1alpha1
+kind: Blueprint
+metadata:
+  labels:
+    ai-factory.suse.com/blueprint-name: traefik-ai-gateway-demo
+    ai-factory.suse.com/blueprint-version: 0.1.0
+  name: traefik-ai-gateway-demo-0-1-0
+spec:
+  displayName: Traefik AI Gateway with SUSE AI (Ollama, vLLM, Milvus, Open WebUI)
+  version: 0.1.0
+  source: Partner
+  description: |
+    Identity-aware AI and MCP gateway with Traefik Hub in front of the SUSE AI
+    stack. Keycloak issues the tokens; Traefik routes each chat by group and
+    model to Ollama (CPU) or vLLM (GPU), applies per-group and per-user token
+    rate limits (Redis), a semantic cache (Milvus), and prompt safety checks
+    (llama-guard3), and governs MCP tool access per identity (TBAC). Open WebUI
+    signs users in with Keycloak and forwards each user's token, so browser
+    users get exactly the same policies as API clients.
+
+    Prerequisites: Traefik Hub on the cluster (managed by RKE2) with the AI and
+    MCP gateways enabled, cert-manager, a default StorageClass, and a GPU node
+    with the NVIDIA GPU Operator.
+  components:
+    # --- Gateway configuration (this repository's Helm repo) -------------------
+    - chartName: traefik-ai-gateway
+      chartRepo: traefik-ai-gateway
+      chartVersion: 0.1.0
+      releaseName: traefik-ai-gateway
+      values:
+        domain: ""            # REQUIRED, e.g. 203.0.113.10.sslip.io
+        tls:
+          issuer: letsencrypt
+          acmeEmail: ""       # optional Let's Encrypt account contact
+        vllmModel: Qwen/Qwen2.5-1.5B-Instruct
+
+    # --- Models -----------------------------------------------------------------
+    - chartName: ollama
+      chartRepo: application-collection
+      chartVersion: 1.76.0
+      releaseName: ollama
+      values:
+        fullnameOverride: ollama
+        ollama:
+          gpu:
+            enabled: false
+          models:
+            pull:
+              # Must contain the models the traefik-ai-gateway chart routes to
+              # and guards with (backends.ollama.models.*, embeddingModel,
+              # guardModel, jailbreak.judge.model): Ollama model names live in
+              # both places, like the vLLM model name.
+              - qwen2.5:0.5b        # chat, admins + developers
+              - smollm2:135m        # chat, admins only
+              - nomic-embed-text    # semantic-cache vectorizer
+              - llama-guard3:1b     # llm-guard safety model
+            run:
+              - qwen2.5:0.5b
+              - smollm2:135m
+              - llama-guard3:1b
+        extraEnv:
+          - name: OLLAMA_KEEP_ALIVE
+            value: "-1"
+          - name: OLLAMA_MAX_LOADED_MODELS
+            value: "4"
+          # Two requests at a time: a short guard call does not queue behind a
+          # long chat answer (the guards time out after llmGuard.timeoutSeconds).
+          - name: OLLAMA_NUM_PARALLEL
+            value: "2"
+        persistentVolume:
+          enabled: true
+          size: 20Gi
+        # The four models need about 2.5-3 GB of RAM once loaded. The CPU limit
+        # keeps CPU inference (chat model plus two guard models per prompt)
+        # from taking every core of the node; on small clusters that node also
+        # runs the control plane and Traefik. 2 is too low: guard calls queue
+        # up and time out.
+        resources:
+          requests:
+            cpu: "1"
+            memory: 3Gi
+          limits:
+            cpu: "3"
+            memory: 6Gi
+        # Keep Ollama off the GPU node; vLLM owns it.
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - key: nvidia.com/gpu.present
+                      operator: NotIn
+                      values: ["true"]
+
+    - chartName: vllm
+      chartRepo: application-collection
+      chartVersion: 0.1.10
+      releaseName: vllm
+      values:
+        servingEngineSpec:
+          # Only the gateway knows this key (chat-completion middleware token),
+          # so nothing can reach the GPU without going through Traefik.
+          vllmApiKey:
+            secretName: vllm-api-key
+            secretKey: key
+          # Empty: the GPU is injected by the NVIDIA GPU Operator's NRI/CDI plugin
+          # (gpu-operator v26+, cdi.nriPluginEnabled), which registers no
+          # "nvidia" containerd runtime. The chart's default "nvidia" fails there
+          # with "no runtime for nvidia is configured". Set it to nvidia in the
+          # wizard if your GPU Operator uses the runtime-class mode.
+          runtimeClassName: ""
+          # One GPU: the chart's default rolling update (maxSurge 100%,
+          # maxUnavailable 0) starts the new pod first, which stays Pending
+          # until the old one frees the GPU. Recreate stops the old pod first.
+          strategy:
+            type: Recreate
+          modelSpec:
+            - name: gpu-model
+              registry: dp.apps.rancher.io
+              repository: containers/vllm-openai
+              tag: "0.19.0-5.20"
+              modelURL: Qwen/Qwen2.5-1.5B-Instruct   # must equal traefik-ai-gateway vllmModel
+              replicaCount: 1
+              requestCPU: 4
+              requestMemory: 16Gi
+              requestGPU: 1
+              pvcStorage: 50Gi
+              # The image lacks pydantic-extra-types (and its pycountry), which
+              # vLLM's chat path imports through mistral_common: chat requests
+              # fail with HTTP 500 "No module named 'pydantic_extra_types'".
+              # An init container (same image, keep the tag equal) installs the
+              # two packages into an emptyDir, put first on PYTHONPATH. Needs
+              # outbound access to bootstrap.pypa.io and pypi.org.
+              initContainer:
+                name: install-python-deps
+                image: dp.apps.rancher.io/containers/vllm-openai:0.19.0-5.20
+                command:
+                  - sh
+                  - -c
+                  - |
+                    set -e
+                    if ! python3.11 -m pip --version >/dev/null 2>&1; then
+                      python3.11 -c "import urllib.request; urllib.request.urlretrieve('https://bootstrap.pypa.io/get-pip.py', '/tmp/get-pip.py')"
+                      python3.11 /tmp/get-pip.py --user --quiet
+                    fi
+                    python3.11 -m pip install --quiet --no-deps --target=/deps \
+                      pydantic-extra-types==2.11.1 pycountry==26.2.16
+                extraVolumeMounts:
+                  - name: python-deps
+                    mountPath: /deps
+              extraVolumes:
+                - name: python-deps
+                  emptyDir: {}
+              extraVolumeMounts:
+                - name: python-deps
+                  mountPath: /deps
+              env:
+                - name: PYTHONPATH
+                  value: /deps
+              vllmConfig:
+                maxModelLen: 8192
+                gpuMemoryUtilization: 0.90
+                # No extraArgs: vLLM 0.19 rejects --disable-log-requests (request
+                # logging is off by default in recent vLLM releases).
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - key: nvidia.com/gpu.present
+                      operator: In
+                      values: ["true"]
+        routerSpec:
+          replicaCount: 1
+          routingLogic: roundrobin
+
+    # --- Data -------------------------------------------------------------------
+    - chartName: milvus
+      chartRepo: application-collection
+      chartVersion: 5.0.25
+      releaseName: milvus
+      values:
+        # Semantic-cache vectors for Traefik and RAG vectors for Open WebUI.
+        fullnameOverride: milvus
+        cluster:
+          enabled: false
+        standalone:
+          messageQueue: woodpecker
+          persistence:
+            persistentVolumeClaim:
+              size: 10Gi
+        kafka:
+          enabled: false
+        etcd:
+          replicaCount: 1
+        minio:
+          mode: standalone
+          replicas: 1
+          persistence:
+            size: 10Gi
+          resources:
+            requests:
+              memory: 512Mi
+
+    - chartName: redis
+      chartRepo: application-collection
+      chartVersion: 2.8.0
+      releaseName: redis
+      values:
+        # Token buckets for the ai-rate-limit middlewares.
+        fullnameOverride: redis
+        architecture: standalone
+        nodeCount: 1
+        auth:
+          enabled: true
+          existingSecret: redis-auth   # created by traefik-ai-gateway
+          passwordKey: password
+
+    # --- UI -----------------------------------------------------------------------
+    - chartName: open-webui
+      chartRepo: application-collection
+      chartVersion: 8.19.1
+      releaseName: open-webui
+      values:
+        ollama:
+          enabled: false
+        # Left empty on purpose: the gateway URL, SSO settings and MCP tool
+        # servers come from the open-webui-gateway-env secret (created by
+        # traefik-ai-gateway from its domain value) through extraEnvFrom.
+        enableOpenaiApi: true
+        openaiBaseApiUrl: ""
+        openaiApiKey: ""
+        sso:
+          enabled: false
+        # Seeds the gateway connection's Auth = OAuth (auth_type system_oauth),
+        # so chats carry each user's own token without the manual admin step.
+        # Open WebUI 0.6.41 has no env var for connection settings, but it
+        # imports DATA_DIR/config.json into its config database at start-up
+        # (and renames it). Written only before the first start (no webui.db
+        # yet), so later admin changes persist. Then the chart's usual copy.
+        copyAppData:
+          command:
+            - sh
+            - -c
+            - |
+              if [ ! -f /tmp/app-data/webui.db ]; then
+                printf '%s' '{"version":0,"ui":{},"openai":{"api_configs":{"0":{"enable":true,"auth_type":"system_oauth"}}}}' > /tmp/app-data/config.json
+              fi
+              cp -R -n /app/backend/data/* /tmp/app-data/
+        extraEnvFrom:
+          - secretRef:
+              name: open-webui-gateway-env
+        # Open WebUI preferences. Settings that depend on the domain, the
+        # Keycloak realm or the gateway's policies come from the
+        # open-webui-gateway-env secret (traefik-ai-gateway); a variable set
+        # here wins over the same one in that secret. This is a list: an
+        # override in the wizard replaces it whole.
+        extraEnvVars:
+          # No built-in "Arena Model" (blind A/B evaluation) in the model list.
+          - name: ENABLE_EVALUATION_ARENA_MODELS
+            value: "false"
+          # Every user sees every model; the gateway decides who may use it.
+          - name: BYPASS_MODEL_ACCESS_CONTROL
+            value: "true"
+          - name: DEFAULT_USER_ROLE
+            value: user
+          # Open WebUI groups follow the Keycloak groups claim.
+          - name: ENABLE_OAUTH_GROUP_MANAGEMENT
+            value: "true"
+          # RAG on the same Milvus as the semantic cache, as in SUSE's
+          # simple-chatbot-with-rag-vllm blueprint.
+          - name: VECTOR_DB
+            value: milvus
+          - name: MILVUS_URI
+            value: http://milvus:19530
+          - name: RAG_EMBEDDING_MODEL
+            value: sentence-transformers/all-MiniLM-L6-v2
+        # Served by the traefik-ai-gateway IngressRoute at chat.<domain>.
+        ingress:
+          enabled: false
+        persistence:
+          enabled: true
+          size: 2Gi
+        # If the pod cannot reach ai.<domain> / keycloak.<domain> through the
+        # load balancer from inside the cluster, pin them to the Traefik
+        # ClusterIP here in the wizard:
+        # hostAliases:
+        #   - ip: <kubectl -n traefik get svc traefik -o jsonpath='{.spec.clusterIP}'>
+        #     hostnames: [ai.<domain>, keycloak.<domain>]
+        hostAliases: []
+
+    # --- Observability --------------------------------------------------------------
+    - chartName: opentelemetry-collector
+      chartRepo: application-collection
+      chartVersion: 0.174.2
+      releaseName: otel-collector
+      values:
+        # Traefik sends OTLP/HTTP to otel-collector.<namespace>:4318; the
+        # collector forwards to SUSE Observability over OTLP/gRPC.
+        #
+        # Per-install settings, set in the wizard (plain values; the chart
+        # renders config and extraManifests through tpl):
+        suseObservability:
+          endpoint: ""      # OTLP gRPC endpoint, e.g. otlp-observability.example.com:443
+          clusterName: ""   # cluster name shown in SUSE Observability
+          apiKey: ""        # SUSE Observability API key (stored in a Secret)
+        fullnameOverride: otel-collector
+        mode: deployment
+        image:
+          # contrib ships the bearertokenauth extension.
+          tag: "0.161.0-contrib-16.2"
+        presets:
+          kubernetesAttributes:
+            enabled: true
+        extraManifests:
+          - apiVersion: v1
+            kind: Secret
+            metadata:
+              name: suse-observability-otlp
+            type: Opaque
+            stringData:
+              api-key: '{{ .Values.suseObservability.apiKey }}'
+        extraEnvs:
+          - name: SUSE_OBS_API_KEY
+            valueFrom:
+              secretKeyRef:
+                name: suse-observability-otlp
+                key: api-key
+        config:
+          extensions:
+            bearertokenauth:
+              scheme: SUSEObservability
+              token: "${env:SUSE_OBS_API_KEY}"
+          receivers:
+            otlp:
+              protocols:
+                grpc:
+                  endpoint: ${env:MY_POD_IP}:4317
+                http:
+                  endpoint: ${env:MY_POD_IP}:4318
+          processors:
+            batch: {}
+            resource:
+              attributes:
+                - key: k8s.cluster.name
+                  value: '{{ .Values.suseObservability.clusterName }}'
+                  action: upsert
+          exporters:
+            otlp/suse-observability:
+              endpoint: '{{ .Values.suseObservability.endpoint }}'
+              auth:
+                authenticator: bearertokenauth
+              compression: snappy
+          service:
+            extensions:
+              - health_check
+              - bearertokenauth
+            pipelines:
+              traces:
+                receivers: [otlp]
+                processors: [memory_limiter, resource, batch]
+                exporters: [otlp/suse-observability]
+              metrics:
+                receivers: [otlp]
+                processors: [memory_limiter, resource, batch]
+                exporters: [otlp/suse-observability]
+              logs:
+                receivers: [otlp]
+                processors: [memory_limiter, resource, batch]
+                exporters: [otlp/suse-observability]
+        resources:
+          limits:
+            memory: 512Mi
+
+    - chartName: suse-ai-observability-extension
+      chartRepo: application-collection
+      chartVersion: 2.2.0
+      releaseName: ai-observability
+      values:
+        # Installs the GenAI StackPack in SUSE Observability for this cluster.
+        serverUrl: ""                      # e.g. https://observability.example.com
+        apiToken: ""                       # SUSE Observability CLI token (the chart stores it in a Secret)
+        tokenType: api
+        kubernetesClusters: []             # e.g. [local]

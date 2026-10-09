@@ -1,0 +1,13 @@
+# Rancher ClusterRepo for the traefik-ai-gateway chart: a plain HTTP Helm repo
+# (index.yaml + .tgz) served straight from this git repository. The blueprint's
+# component references it by name (chartRepo: traefik-ai-gateway). The AI
+# Factory operator passes the URL to Fleet, which reads index.yaml and pulls the
+# chart; no OCI registry and no Rancher API token are involved.
+#
+# `make clusterrepo` regenerates this file from REPO_OWNER / REPO_NAME / BRANCH.
+apiVersion: catalog.cattle.io/v1
+kind: ClusterRepo
+metadata:
+  name: traefik-ai-gateway
+spec:
+  url: https://raw.githubusercontent.com/e-minguez/traefik-ai-factory-blueprint/main/repo

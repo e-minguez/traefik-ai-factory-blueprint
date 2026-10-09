@@ -1,0 +1,18 @@
+# Catalog entry for the SUSE AI Factory UI. Synced together with the
+# Blueprint CRs in this directory by the operator's blueprintCatalogs Fleet
+# GitRepo (see README, "Register the blueprint").
+apiVersion: ai-factory.suse.com/v1alpha1
+kind: BlueprintCatalog
+metadata:
+  name: traefik
+spec:
+  displayName: Traefik Blueprints
+  description: Traefik Hub AI gateway and MCP gateway blueprints for SUSE AI Factory.
+  categories: [inference, agents, security]
+  maintainer:
+    name: Traefik Labs
+    url: https://traefik.io
+  blueprints:
+    - name: traefik-ai-gateway-demo
+      category: security
+      featured: true

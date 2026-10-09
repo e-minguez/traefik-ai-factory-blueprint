@@ -1,0 +1,211 @@
+{{- $ai := include "tag.aiHost" . -}}
+{{- $ollama := .Values.backends.ollama -}}
+{{- $vllm := .Values.backends.vllm -}}
+# Chat uses multi-layer routing: the parent router authenticates, then a child
+# router picks the backend from the caller's group (X-Groups, set by
+# gateway-jwt) and the requested model (Model(), read from the request body).
+#
+#   admins      {{ $ollama.models.developer }}, {{ $ollama.models.admin }}  -> SUSE AI Ollama (CPU)
+#   admins      {{ .Values.vllmModel }}  -> SUSE AI vLLM (GPU)
+#   developers  {{ $ollama.models.developer }}  -> SUSE AI Ollama (CPU)
+#   anything else  -> 403
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: chat-parent
+  labels:
+    {{- include "tag.labels" . | nindent 4 }}
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - kind: Rule
+      match: Host(`{{ $ai }}`) && PathPrefix(`/v1/chat/completions`)
+      middlewares:
+        - name: sanitize-identity
+        - name: gateway-jwt
+  tls:
+    secretName: demo-tls
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: chat-children
+  labels:
+    {{- include "tag.labels" . | nindent 4 }}
+spec:
+  parentRefs:
+    - name: chat-parent
+      namespace: {{ .Release.Namespace }}
+  routes:
+    - kind: Rule
+      priority: 100
+      match: PathPrefix(`/v1/chat/completions`) && {{ include "tag.groupMatch" "admins" }} && Model(`{{ $ollama.models.developer }}`)
+      middlewares:
+        {{- include "tag.aiChain" (dict "ctx" $ "cc" "cc-developer-model" "group" "admins" "model" $ollama.models.developer) }}
+      services:
+        - name: {{ $ollama.service }}
+          port: {{ $ollama.port }}
+    - kind: Rule
+      priority: 100
+      match: PathPrefix(`/v1/chat/completions`) && {{ include "tag.groupMatch" "admins" }} && Model(`{{ $ollama.models.admin }}`)
+      middlewares:
+        {{- include "tag.aiChain" (dict "ctx" $ "cc" "cc-admin-model" "group" "admins" "model" $ollama.models.admin) }}
+      services:
+        - name: {{ $ollama.service }}
+          port: {{ $ollama.port }}
+    # The GPU model is admins-only. With failover, model pinning happens per
+    # backend inside the vllm-failover TraefikService.
+    - kind: Rule
+      priority: 100
+      match: PathPrefix(`/v1/chat/completions`) && {{ include "tag.groupMatch" "admins" }} && Model(`{{ .Values.vllmModel }}`)
+      middlewares:
+        {{- include "tag.aiChain" (dict "ctx" $ "cc" (ternary "" "cc-vllm" .Values.failover.enabled) "group" "admins" "model" .Values.vllmModel) }}
+      services:
+        {{- if .Values.failover.enabled }}
+        - name: vllm-failover
+          kind: TraefikService
+        {{- else }}
+        - name: {{ $vllm.service }}
+          port: {{ $vllm.port }}
+        {{- end }}
+    - kind: Rule
+      priority: 90
+      match: PathPrefix(`/v1/chat/completions`) && {{ include "tag.groupMatch" "developers" }} && Model(`{{ $ollama.models.developer }}`)
+      middlewares:
+        {{- include "tag.aiChain" (dict "ctx" $ "cc" "cc-developer-model" "group" "developers" "model" $ollama.models.developer) }}
+      services:
+        - name: {{ $ollama.service }}
+          port: {{ $ollama.port }}
+    # Open WebUI copies of the routes above (X-OpenWebUI-User-* headers): same
+    # chain, but the deny-capable middlewares answer HTTP 200 so Open WebUI can
+    # show the message (see middlewares.yaml).
+    - kind: Rule
+      priority: 105
+      match: PathPrefix(`/v1/chat/completions`) && {{ include "tag.groupMatch" "admins" }} && Model(`{{ $ollama.models.developer }}`) && {{ include "tag.openWebUIMatch" . }}
+      middlewares:
+        {{- include "tag.aiChain" (dict "ctx" $ "cc" "cc-developer-model" "group" "admins" "model" $ollama.models.developer "ui" true) }}
+      services:
+        - name: {{ $ollama.service }}
+          port: {{ $ollama.port }}
+    - kind: Rule
+      priority: 105
+      match: PathPrefix(`/v1/chat/completions`) && {{ include "tag.groupMatch" "admins" }} && Model(`{{ $ollama.models.admin }}`) && {{ include "tag.openWebUIMatch" . }}
+      middlewares:
+        {{- include "tag.aiChain" (dict "ctx" $ "cc" "cc-admin-model" "group" "admins" "model" $ollama.models.admin "ui" true) }}
+      services:
+        - name: {{ $ollama.service }}
+          port: {{ $ollama.port }}
+    - kind: Rule
+      priority: 105
+      match: PathPrefix(`/v1/chat/completions`) && {{ include "tag.groupMatch" "admins" }} && Model(`{{ .Values.vllmModel }}`) && {{ include "tag.openWebUIMatch" . }}
+      middlewares:
+        {{- include "tag.aiChain" (dict "ctx" $ "cc" (ternary "" "cc-vllm" .Values.failover.enabled) "group" "admins" "model" .Values.vllmModel "ui" true) }}
+      services:
+        {{- if .Values.failover.enabled }}
+        - name: vllm-failover
+          kind: TraefikService
+        {{- else }}
+        - name: {{ $vllm.service }}
+          port: {{ $vllm.port }}
+        {{- end }}
+    - kind: Rule
+      priority: 95
+      match: PathPrefix(`/v1/chat/completions`) && {{ include "tag.groupMatch" "developers" }} && Model(`{{ $ollama.models.developer }}`) && {{ include "tag.openWebUIMatch" . }}
+      middlewares:
+        {{- include "tag.aiChain" (dict "ctx" $ "cc" "cc-developer-model" "group" "developers" "model" $ollama.models.developer "ui" true) }}
+      services:
+        - name: {{ $ollama.service }}
+          port: {{ $ollama.port }}
+    # Catch-all: anything not matched above is denied by content-guard.
+    # The service is required by the leaf-router contract but never reached.
+    # Explicit low priorities: priority 0 means "unset" in Traefik, which then
+    # uses the rule length (~15 for PathPrefix(`/`)) and would beat the UI one.
+    - kind: Rule
+      priority: 2
+      match: PathPrefix(`/`) && {{ include "tag.openWebUIMatch" . }}
+      middlewares:
+        - name: deny-403-ui
+      services:
+        - name: {{ $ollama.service }}
+          port: {{ $ollama.port }}
+    - kind: Rule
+      priority: 1
+      match: PathPrefix(`/`)
+      middlewares:
+        - name: deny-403
+      services:
+        - name: {{ $ollama.service }}
+          port: {{ $ollama.port }}
+---
+# Public model catalog for OpenAI clients (Open WebUI lists models here).
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: model-catalog
+  labels:
+    {{- include "tag.labels" . | nindent 4 }}
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - kind: Rule
+      match: Host(`{{ $ai }}`) && (Path(`/v1/models`) || Path(`/v1/models/`))
+      services:
+        - name: model-catalog
+          port: 8080
+  tls:
+    secretName: demo-tls
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: open-webui
+  labels:
+    {{- include "tag.labels" . | nindent 4 }}
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - kind: Rule
+      match: Host(`{{ include "tag.chatHost" . }}`)
+      {{- if .Values.waf.enabled }}
+      middlewares:
+        - name: waf
+      {{- end }}
+      services:
+        - name: {{ .Values.backends.openWebUI.service }}
+          port: {{ .Values.backends.openWebUI.port }}
+  tls:
+    secretName: demo-tls
+{{- if .Values.failover.enabled }}
+---
+# GPU resilience: vLLM first; on 429 / 5xx (including "no ready pod") the
+# buffered request is replayed to Ollama with a CPU model. Each backend pins
+# its own model, so the answer's "model" field shows who served it.
+apiVersion: traefik.io/v1alpha1
+kind: TraefikService
+metadata:
+  name: vllm-failover
+  labels:
+    {{- include "tag.labels" . | nindent 4 }}
+spec:
+  failover:
+    service:
+      name: {{ $vllm.service }}
+      port: {{ $vllm.port }}
+      middlewares:
+        - name: cc-vllm
+    fallback:
+      name: {{ $ollama.service }}
+      port: {{ $ollama.port }}
+      middlewares:
+        - name: cc-vllm-fallback
+    errors:
+      status:
+        - "429"
+        - "500-504"
+      # Requests are buffered for the replay; Model() matching already caps
+      # bodies at 1 MiB (hub.aigateway.maxRequestBodySize).
+      maxRequestBodyBytes: 1048576
+{{- end }}

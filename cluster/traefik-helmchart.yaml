@@ -1,0 +1,154 @@
+# Prerequisite: Traefik Hub as the cluster's ingress controller, installed by
+# RKE2's Helm controller instead of the embedded rke2-traefik/rke2-ingress-nginx.
+#
+# Full procedure with checks: docs/prerequisites.md, section 2. In short:
+# 1. ingress-controller: none on every control-plane node, restart rke2-server.
+# 2. With the Hub token in the clipboard:
+#      pbpaste | tr -d '[:space:]' | \
+#        kubectl -n traefik create secret generic traefik-hub-license --from-file=token=/dev/stdin
+#    (or, if an earlier HelmChart created it through extraObjects:
+#     kubectl -n traefik annotate secret traefik-hub-license helm.sh/resource-policy=keep)
+# 3. kubectl apply -f cluster/traefik-helmchart.yaml
+#
+# Environment-specific, adjust to your cluster: DaemonSet on control-plane
+# nodes only, hostPorts 80/443/8080, proxyProtocol trusted from the load
+# balancer subnet 10.20.0.0/16.
+#
+# The OTLP endpoints assume the blueprint is installed in namespace
+# traefik-ai-gateway-demo-system; change them if you use another one, or drop the
+# log/accessLog/metrics/tracing OTLP blocks without SUSE Observability.
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: traefik
+  namespace: kube-system
+spec:
+  chart: traefik
+  repo: https://traefik.github.io/charts
+  # Chart 41.7.0 with the Traefik Hub image pinned to v3.20.13 (below). Hub
+  # v3.20.14 and v3.21.1 (Traefik Proxy v3.7.14) reject child IngressRoutes
+  # (parentRefs), which the chat routing needs: see docs/known-issues.md and
+  # https://github.com/traefik/traefik/issues/14016.
+  version: 41.7.0
+  targetNamespace: traefik
+  createNamespace: true
+  valuesContent: |-
+    # The chart defaults to an affected Hub version; see docs/known-issues.md.
+    # The registry and repository switch to traefik-hub because hub.token is set.
+    image:
+      tag: v3.20.13
+    deployment:
+      kind: DaemonSet
+    updateStrategy:
+      type: RollingUpdate
+      rollingUpdate:
+        maxUnavailable: 1
+        maxSurge: 0
+    service:
+      type: ClusterIP
+    # Traefik shares the control-plane nodes with Rancher, the Kubernetes
+    # control plane and, on small clusters, Ollama's CPU inference. Without a
+    # CPU request it gets no guaranteed share when the CPU is contended, /ping
+    # misses the default 2 s probe timeout and the kubelet restarts Traefik.
+    resources:
+      requests:
+        cpu: 500m
+        memory: 256Mi
+    # Start-up (license check, all routes, the WAF rule sets) can take more
+    # than the ~30 s the liveness probe allows: give it up to 3 minutes.
+    startupProbe:
+      httpGet:
+        path: /ping
+        port: 8080
+        scheme: HTTP
+      periodSeconds: 5
+      timeoutSeconds: 5
+      failureThreshold: 36
+    livenessProbe:
+      timeoutSeconds: 5
+      failureThreshold: 3
+    readinessProbe:
+      timeoutSeconds: 5
+      failureThreshold: 3
+    nodeSelector:
+      node-role.kubernetes.io/control-plane: "true"
+    tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      - key: CriticalAddonsOnly
+        operator: Exists
+    ports:
+      traefik:
+        hostPort: 8080
+      web:
+        hostPort: 80
+        proxyProtocol:
+          trustedIPs:
+            - 10.20.0.0/16
+      websecure:
+        hostPort: 443
+        proxyProtocol:
+          trustedIPs:
+            - 10.20.0.0/16
+
+    providers:
+      kubernetesCRD:
+        # DeepWiki is reached through an ExternalName service.
+        allowExternalNameServices: true
+
+    hub:
+      # Name of the secret holding the license under key "token".
+      token: traefik-hub-license
+      aigateway:
+        enabled: true
+        # Model() reads the request body; bodies above this size do not match.
+        maxRequestBodySize: 1048576
+      mcpgateway:
+        enabled: true
+        maxRequestBodySize: 2097152
+
+    # Telemetry to the blueprint's OpenTelemetry collector -> SUSE Observability.
+    log:
+      otlp:
+        enabled: true
+        serviceName: traefik-ai-gateway
+        http:
+          enabled: true
+          endpoint: http://otel-collector.traefik-ai-gateway-demo-system.svc.cluster.local:4318/v1/logs
+    accessLog:
+      enabled: true
+      format: json
+      # Also write access logs to stdout: with OTLP on, Traefik sends them only
+      # to the collector (kubectl logs shows nothing, and nothing at all is kept
+      # without a collector).
+      dualOutput: true
+      fields:
+        headers:
+          # Keep X-User / X-Groups / X-OpenWebUI-User-*, never ship tokens.
+          defaultMode: keep
+          names:
+            Authorization: drop
+            Cookie: drop
+      otlp:
+        enabled: true
+        serviceName: traefik-ai-gateway
+        http:
+          enabled: true
+          endpoint: http://otel-collector.traefik-ai-gateway-demo-system.svc.cluster.local:4318/v1/logs
+    metrics:
+      otlp:
+        enabled: true
+        serviceName: traefik-ai-gateway
+        http:
+          enabled: true
+          endpoint: http://otel-collector.traefik-ai-gateway-demo-system.svc.cluster.local:4318/v1/metrics
+    tracing:
+      serviceName: traefik-ai-gateway
+      otlp:
+        enabled: true
+        http:
+          enabled: true
+          endpoint: http://otel-collector.traefik-ai-gateway-demo-system.svc.cluster.local:4318/v1/traces
+    experimental:
+      otlpLogs: true

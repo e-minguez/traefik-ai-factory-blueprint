@@ -1,0 +1,10 @@
+*.bak
+.DS_Store
+
+# Local working notes, not published
+docs/HANDOFF.md
+TESTING.md
+CLAUDE.md
+
+kubeconfig
+*.kubeconfig

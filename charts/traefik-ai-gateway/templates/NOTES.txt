@@ -1,0 +1,12 @@
+Traefik AI gateway configured in namespace {{ .Release.Namespace }}.
+
+  Open WebUI     https://{{ include "tag.chatHost" . }}   (sign in as admin@ai-factory.demo FIRST)
+  AI gateway     https://{{ include "tag.aiHost" . }}/v1/chat/completions
+  MCP gateway    https://{{ include "tag.aiHost" . }}/mcp/ai-factory{{ if .Values.deepwiki.enabled }}  https://{{ include "tag.aiHost" . }}/mcp/deepwiki{{ end }}
+{{- if .Values.inspector.enabled }}
+  MCP Inspector  https://{{ include "tag.inspectorHost" . }}
+{{- end }}
+  Keycloak       https://{{ include "tag.kcHost" . }}
+
+Open WebUI's gateway connection uses Auth: OAuth (seeded by the blueprint), so
+chats carry each user's token. Check: Admin Panel > Settings > Connections.

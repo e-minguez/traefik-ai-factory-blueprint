@@ -1,0 +1,24 @@
+apiVersion: v1
+entries:
+  traefik-ai-gateway:
+  - annotations:
+      traefik.io/hub-version: v3.20.13
+    apiVersion: v2
+    appVersion: 0.1.0
+    created: "2026-10-09T17:27:38.430791+02:00"
+    description: 'Traefik Hub AI gateway and MCP gateway configuration for the SUSE
+      AI Factory "Traefik AI Gateway" blueprint: Keycloak, the model catalog, the
+      ops MCP server, the MCP Inspector, the demo certificate, shared secrets, and
+      every Traefik Middleware and IngressRoute in front of the SUSE AI charts.'
+    digest: f7f6c42f1fa2471d8006abc11f5ee23f4c5886bc0f5425809c9b710e16357330
+    keywords:
+    - traefik
+    - ai-gateway
+    - mcp
+    - suse-ai
+    name: traefik-ai-gateway
+    type: application
+    urls:
+    - https://raw.githubusercontent.com/e-minguez/traefik-ai-factory-blueprint/main/repo/traefik-ai-gateway-0.1.0.tgz
+    version: 0.1.0
+generated: "2026-10-09T17:27:38.43007+02:00"

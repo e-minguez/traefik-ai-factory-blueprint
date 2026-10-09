@@ -1,0 +1,18 @@
+apiVersion: v2
+name: traefik-ai-gateway
+description: >-
+  Traefik Hub AI gateway and MCP gateway configuration for the SUSE AI Factory
+  "Traefik AI Gateway" blueprint: Keycloak, the model catalog, the ops MCP
+  server, the MCP Inspector, the demo certificate, shared secrets, and every
+  Traefik Middleware and IngressRoute in front of the SUSE AI charts.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - traefik
+  - ai-gateway
+  - mcp
+  - suse-ai
+annotations:
+  # The Traefik Hub DaemonSet is a prerequisite managed by RKE2, not by this chart.
+  traefik.io/hub-version: v3.20.13

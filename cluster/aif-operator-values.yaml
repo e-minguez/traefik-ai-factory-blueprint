@@ -1,0 +1,17 @@
+# Addition to the aif-operator Helm values: sync this repository's blueprints/
+# directory (Blueprint + BlueprintCatalog CRs) through a Fleet GitRepo, so the
+# blueprint appears in the SUSE AI Factory UI.
+#
+#   helm upgrade aif-operator "${AIF_CHART}" -n "${AIF_NAMESPACE}" --version "${AIF_VERSION}" \
+#     --reuse-values -f cluster/aif-operator-values.yaml
+#
+# with AIF_CHART=oci://ghcr.io/suse/chart/aif-operator, AIF_NAMESPACE=aif-operator
+# and AIF_VERSION the installed version (README, "Register the blueprint").
+# On a fresh install, pass it to `helm install` instead (docs/prerequisites.md).
+#
+# `make clusterrepo` also regenerates this file from REPO_OWNER / REPO_NAME / BRANCH.
+blueprintCatalogs:
+  - name: traefik
+    repoURL: https://github.com/e-minguez/traefik-ai-factory-blueprint.git
+    branch: main
+    paths: [blueprints]

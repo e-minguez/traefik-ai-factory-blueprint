@@ -1,0 +1,56 @@
+# What the SUSE AI Factory install wizard creates for this blueprint, as a
+# manifest: the blueprint on Rancher's own ("local") cluster. The variables
+# are filled in by envsubst from your shell (envsubst ships with gettext:
+# `brew install gettext` on macOS):
+#
+#   export NAMESPACE=traefik-ai-gateway-demo-system
+#   export DOMAIN=203.0.113.10.sslip.io            # <load-balancer-ip>.sslip.io
+#   export ACME_EMAIL=you@example.com             # optional, Let's Encrypt account contact
+#   export CLUSTER_NAME=local                      # name in SUSE Observability
+#   export SUSE_OBS_URL=https://observability.example.com
+#   export SUSE_OBS_OTLP_ENDPOINT=otlp-observability.example.com:443
+#   export SUSE_OBS_OTLP_API_KEY=...               # SUSE Observability API key
+#   export SUSE_OBS_CLI_TOKEN=...                  # SUSE Observability CLI token
+#   envsubst < examples/aiworkload-local.yaml | kubectl apply -f -
+#
+# The wizard writes the same componentValues.
+apiVersion: ai-factory.suse.com/v1alpha1
+kind: AIWorkload
+metadata:
+  name: traefik-ai-gateway-demo
+  namespace: ${NAMESPACE}
+spec:
+  displayName: Traefik AI Gateway demo
+  deployStrategy: FleetBundle
+  source:
+    sourceType: Blueprint
+    blueprint:
+      name: traefik-ai-gateway-demo
+      version: 0.1.0
+  targetNamespace: ${NAMESPACE}
+  targetClusters:
+    - local
+  componentValues:
+    - componentName: traefik-ai-gateway
+      values:
+        domain: ${DOMAIN}
+        tls:
+          acmeEmail: ${ACME_EMAIL}
+    - componentName: opentelemetry-collector
+      values:
+        suseObservability:
+          endpoint: ${SUSE_OBS_OTLP_ENDPOINT}
+          clusterName: ${CLUSTER_NAME}
+          apiKey: ${SUSE_OBS_OTLP_API_KEY}
+    - componentName: suse-ai-observability-extension
+      values:
+        serverUrl: ${SUSE_OBS_URL}
+        apiToken: ${SUSE_OBS_CLI_TOKEN}
+        kubernetesClusters:
+          - ${CLUSTER_NAME}
+    # No SUSE Observability? Drop the two blocks above and disable both
+    # observability components instead:
+    # - componentName: opentelemetry-collector
+    #   enabled: false
+    # - componentName: suse-ai-observability-extension
+    #   enabled: false

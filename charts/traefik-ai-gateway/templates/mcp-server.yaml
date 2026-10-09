@@ -1,0 +1,176 @@
+# Self-hosted "AI factory operations" MCP server: in-memory state, run from a
+# SUSE BCI Python image (pip-installs the MCP SDK at start, so it needs PyPI
+# access). The Traefik MCP gateway in front (mcp.yaml) decides which identity
+# may see and call which tool; the server itself trusts whatever reaches it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ai-factory-mcp-requirements
+data:
+  requirements.txt: |
+    mcp==1.22.0
+    uvicorn>=0.32.1
+    anyio==4.11.0
+    httpx>=0.27.0
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ai-factory-mcp-server
+data:
+  main.py: |
+    #!/usr/bin/env python3
+    """
+    AI Factory Operations MCP Server.
+
+    Read tools (list_models, get_gpu_inventory, get_model_quota) are available to
+    every authenticated caller. Privileged tools (restart_model, set_model_quota)
+    mutate state and are gated to the 'admins' group BY THE GATEWAY, not here: this
+    server trusts whatever reaches it, and the Traefik Hub MCP middleware in front
+    enforces identity-aware tool access. That separation is the whole point.
+
+    Backed by in-memory state so the server has no external dependency and starts
+    fast and offline.
+    """
+    import json
+    from mcp.server.fastmcp import FastMCP
+
+    MODELS = {
+        "{{ .Values.backends.ollama.models.developer }}": {"status": "running", "backend": "suse-ai-ollama", "accelerator": "cpu", "token_quota": 100000},
+        "{{ .Values.backends.ollama.models.admin }}": {"status": "running", "backend": "suse-ai-ollama", "accelerator": "cpu", "token_quota": 50000},
+        "{{ .Values.vllmModel }}": {"status": "running", "backend": "suse-ai-vllm", "accelerator": "gpu-0", "token_quota": 200000},
+        "{{ .Values.backends.ollama.embeddingModel }}": {"status": "running", "backend": "suse-ai-ollama", "accelerator": "cpu", "token_quota": 0},
+        "{{ .Values.backends.ollama.guardModel }}": {"status": "running", "backend": "suse-ai-ollama", "accelerator": "cpu", "token_quota": 0},
+    }
+    GPUS = {
+        "gpu-0": {"model": "NVIDIA GPU (vLLM node)", "memory_gb": 24, "utilization_pct": 62},
+    }
+
+    mcp = FastMCP(
+        "AI Factory Operations",
+        instructions="Inspect and operate the models and GPUs in this AI factory tenant.",
+    )
+    # Serve the MCP endpoint at the app root, so after the gateway strips the
+    # /mcp/ai-factory prefix the upstream path lands on "/" (FastMCP defaults to /mcp).
+    mcp.settings.streamable_http_path = "/"
+
+    @mcp.tool()
+    async def list_models() -> str:
+        """List the models served in this AI factory tenant and their status."""
+        return json.dumps(MODELS, indent=2)
+
+    @mcp.tool()
+    async def get_gpu_inventory() -> str:
+        """List the GPUs in this tenant with model, memory, and current utilization."""
+        return json.dumps(GPUS, indent=2)
+
+    @mcp.tool()
+    async def get_model_quota(model: str) -> str:
+        """Get the per-hour token quota configured for a model.
+
+        Args:
+            model: Model name, e.g. qwen2.5:0.5b
+        """
+        m = MODELS.get(model)
+        if not m:
+            return json.dumps({"error": f"unknown model {model}"})
+        return json.dumps({"model": model, "token_quota": m["token_quota"]}, indent=2)
+
+    @mcp.tool()
+    async def restart_model(model: str) -> str:
+        """PRIVILEGED. Restart a model deployment. Admin-only (enforced at the gateway).
+
+        Args:
+            model: Model name to restart, e.g. smollm2:135m
+        """
+        m = MODELS.get(model)
+        if not m:
+            return json.dumps({"error": f"unknown model {model}"})
+        m["status"] = "restarting"
+        return json.dumps({"model": model, "status": "restarting", "ok": True}, indent=2)
+
+    @mcp.tool()
+    async def set_model_quota(model: str, token_quota: int) -> str:
+        """PRIVILEGED. Change a model's per-hour token quota. Admin-only (enforced at the gateway).
+
+        Args:
+            model: Model name, e.g. qwen2.5:0.5b
+            token_quota: New per-hour token quota
+        """
+        m = MODELS.get(model)
+        if not m:
+            return json.dumps({"error": f"unknown model {model}"})
+        m["token_quota"] = int(token_quota)
+        return json.dumps({"model": model, "token_quota": m["token_quota"], "ok": True}, indent=2)
+
+    if __name__ == "__main__":
+        app = mcp.streamable_http_app()
+        import uvicorn
+        uvicorn.run(app, host="0.0.0.0", port=8080)
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-factory-mcp
+  labels:
+    app: ai-factory-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ai-factory-mcp
+  template:
+    metadata:
+      labels:
+        app: ai-factory-mcp
+    spec:
+      containers:
+        - name: mcp-server
+          image: {{ .Values.mcpServer.image }}
+          ports:
+            - containerPort: 8080
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              pip install --no-cache-dir --target /tmp/deps -r /app/requirements.txt && \
+              PYTHONPATH=/tmp/deps python3 /app/main.py
+          volumeMounts:
+            - name: code
+              mountPath: /app/main.py
+              subPath: main.py
+            - name: requirements
+              mountPath: /app/requirements.txt
+              subPath: requirements.txt
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: code
+          configMap:
+            name: ai-factory-mcp-server
+        - name: requirements
+          configMap:
+            name: ai-factory-mcp-requirements
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ai-factory-mcp
+spec:
+  type: ClusterIP
+  selector:
+    app: ai-factory-mcp
+  ports:
+    - name: mcp
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
