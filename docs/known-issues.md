@@ -2,11 +2,14 @@
 
 ## Traefik Proxy v3.7.14 rejects every child IngressRoute (Hub v3.20.14, v3.21.1)
 
-**Status:** confirmed upstream bug, fix announced:
+**Status:** confirmed upstream bug, fixed upstream but **not released yet**:
 [traefik/traefik#14016](https://github.com/traefik/traefik/issues/14016)
 (our report [#14032](https://github.com/traefik/traefik/issues/14032) is a
-duplicate of it). The code was checked on 2026-10-09 against the Traefik
-`v3.7` and `master` branches. **Workaround in this repository:** Traefik Hub is pinned to
+duplicate of it), fix PR
+[#14018](https://github.com/traefik/traefik/pull/14018) merged into `v3.7`
+on 2026-10-12 (commit `51c1c3e6eb`). On 2026-10-13 the latest Traefik Proxy
+release was still v3.7.14, so the fix is expected in v3.7.15 and a Hub release
+built on it. **Workaround in this repository:** Traefik Hub is pinned to
 **v3.20.13** ([`cluster/traefik-helmchart.yaml`](../cluster/traefik-helmchart.yaml)).
 
 | Traefik Hub | Traefik Proxy | Child IngressRoutes |
@@ -129,9 +132,9 @@ spec:
 
 Before moving the pin to a newer Hub version:
 
-1. Look at `pkg/provider/kubernetes/crd/kubernetes_http.go` in the matching
-   Traefik release. Child routers must not get a non-nil `Observability`, or
-   `router.go` must accept metadata-only observability on child routers.
+1. Check the Hub release notes: the bundled Traefik Proxy must be v3.7.15 or
+   later (any release containing #14018). In the code, `pkg/server/router/router.go`
+   must have `!router.Observability.IsMetadataOnly()` in the non-root check.
 2. Or test on the cluster. Change `image.tag` in
    `cluster/traefik-helmchart.yaml`, apply it, then:
 
@@ -155,13 +158,20 @@ Before moving the pin to a newer Hub version:
 
 Tracked in [traefik/traefik#14016](https://github.com/traefik/traefik/issues/14016)
 ("Observability Metadata break non-root router", labelled
-`kind/bug/confirmed`; a maintainer announced a fix on 2026-10-08). The
-change that introduced it is PR
+`kind/bug/confirmed`, closed 2026-10-12). The change that introduced it is PR
 [#12985](https://github.com/traefik/traefik/pull/12985) (commit `a39758f925`).
 Our report, [#14032](https://github.com/traefik/traefik/issues/14032), is a
-duplicate with the Traefik Hub versions and a minimal reproduction. Once a
-fixed Traefik Proxy release is out, check it as described above and move the
-image pin in `cluster/traefik-helmchart.yaml`.
+duplicate with the Traefik Hub versions and a minimal reproduction.
+
+The fix, PR [#14018](https://github.com/traefik/traefik/pull/14018) "Allow
+observability metadata on child routers" (milestone 3.7, merged 2026-10-12),
+keeps the CRD provider as it is and relaxes the check in `router.go`: a child
+router may carry an `Observability` block that holds only `Metadata`
+(new `RouterObservabilityConfig.IsMetadataOnly()`). Access logs, metrics,
+tracing or trace verbosity on a child router are still rejected. This repository
+sets none of them on child IngressRoutes, so the fix covers the blueprint.
+Once a Hub release with Traefik Proxy v3.7.15+ is out, check it as described
+above and move the image pin in `cluster/traefik-helmchart.yaml`.
 
 ## Other issues found during testing
 
