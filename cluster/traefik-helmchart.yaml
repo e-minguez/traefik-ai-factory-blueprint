@@ -25,18 +25,17 @@ metadata:
 spec:
   chart: traefik
   repo: https://traefik.github.io/charts
-  # Chart 41.7.0 with the Traefik Hub image pinned to v3.20.13 (below). Hub
-  # v3.20.14 and v3.21.1 (Traefik Proxy v3.7.14) reject child IngressRoutes
-  # (parentRefs), which the chat routing needs: see docs/known-issues.md and
-  # https://github.com/traefik/traefik/issues/14016.
+  # Chart 41.7.0 with the Traefik Hub image pinned to v3.21.3 (below). The chat
+  # routing needs child IngressRoutes (parentRefs), which require Traefik Proxy
+  # v3.7.15 or later: see docs/known-issues.md.
   version: 41.7.0
   targetNamespace: traefik
   createNamespace: true
   valuesContent: |-
-    # The chart defaults to an affected Hub version; see docs/known-issues.md.
+    # Chart 41.7.0 defaults to Hub v3.21.1, which drops child routes; see docs/known-issues.md.
     # The registry and repository switch to traefik-hub because hub.token is set.
     image:
-      tag: v3.20.13
+      tag: v3.21.3
     deployment:
       kind: DaemonSet
     updateStrategy:

@@ -403,9 +403,8 @@ Guard decisions are recorded in the traces too, including the jailbreak
 judge's verdicts (`jailbreak_attempt`), even when it does not block.
 
 Detailed GenAI metrics (token usage, estimated cost, tokens saved by the
-cache) need Traefik Hub v3.21; the blueprint pins v3.20.13
-([known issues](known-issues.md)). Turn on
-`traefik-ai-gateway.aiMetrics.detailed` once it can.
+cache) need Traefik Hub v3.21. They are off by default; turn on
+`traefik-ai-gateway.aiMetrics.detailed` to show them.
 
 **Say:** "Every decision you saw is traced and logged with the user identity,
 and tokens are never logged."

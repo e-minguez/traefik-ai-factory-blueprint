@@ -15,4 +15,4 @@ keywords:
   - suse-ai
 annotations:
   # The Traefik Hub DaemonSet is a prerequisite managed by RKE2, not by this chart.
-  traefik.io/hub-version: v3.20.13
+  traefik.io/hub-version: v3.21.3

@@ -230,7 +230,7 @@ complete `HelmChart`. Review the environment-specific settings first:
 | `ports.{web,websecure}.proxyProtocol.trustedIPs` | `10.20.0.0/16` | set it to your load balancer's source subnet; remove both blocks if it does not send PROXY protocol |
 | `service.type` | `ClusterIP` (traffic arrives via hostPorts) | you use a `LoadBalancer` service instead |
 | OTLP endpoints | `otel-collector.traefik-ai-gateway-demo-system...` | the blueprint goes to another namespace; remove the `log.otlp`, `accessLog.otlp`, `metrics` and `tracing` blocks without SUSE Observability |
-| `version`, `image.tag` | chart `41.7.0`, Hub image `v3.20.13` | only after checking [known issues](known-issues.md): Hub v3.20.14 and v3.21.1 break the chat routing |
+| `version`, `image.tag` | chart `41.7.0`, Hub image `v3.21.3` | only after checking [known issues](known-issues.md): the Hub image must ship Traefik Proxy v3.7.15 or later |
 
 The file also sets what the blueprint needs, whatever your environment:
 `hub.aigateway` and `hub.mcpgateway` with their request-body size limits,
@@ -262,7 +262,7 @@ kubectl -n traefik rollout status ds/traefik
 
 ```shell
 # Hub image and the flags the blueprint relies on
-kubectl -n traefik get ds traefik -o jsonpath='{..image}{"\n"}'      # ghcr.io/traefik/traefik-hub:v3.20.13
+kubectl -n traefik get ds traefik -o jsonpath='{..image}{"\n"}'      # ghcr.io/traefik/traefik-hub:v3.21.3
 kubectl -n traefik get ds traefik -o jsonpath='{..args}' | tr ',' '\n' \
   | grep -E 'aigateway|mcpgateway|allowExternalNameServices'
 

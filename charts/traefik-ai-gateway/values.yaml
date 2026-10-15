@@ -100,7 +100,7 @@ failover:
 
 # Detailed GenAI metrics (token usage, cost, time to first token) on the
 # chat-completion middlewares, exported over OTLP. Needs Traefik Hub v3.21 or
-# later; the blueprint pins Hub v3.20.13 (docs/known-issues.md): keep false.
+# later.
 aiMetrics:
   detailed: false
 
