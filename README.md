@@ -52,7 +52,7 @@ blueprints/                  Blueprint + BlueprintCatalog CRs, synced by the AI 
 cluster/                     prerequisites and registration: Traefik HelmChart, ClusterRepo, operator values
 docs/prerequisites.md        how to prepare the cluster
 docs/demo.md                 goal of the demo and the demo script
-docs/known-issues.md         known issues (Traefik v3.7 child routes) and fixes found during testing
+docs/known-issues.md         known issues and fixes found during testing
 examples/                    an AIWorkload for the local cluster
 scripts/                     token.sh, chat.sh, agent.sh, verify.sh for the walkthrough
 Makefile                     lint, package, regenerate the URLs, validate the blueprint
@@ -203,7 +203,7 @@ kubectl get clusterissuer "${NAMESPACE}-letsencrypt"         # cluster-scoped; s
 
 ## Known limits
 
-- **Traefik Hub is pinned to v3.20.13.** Hub v3.20.14 and v3.21.1 (Traefik Proxy v3.7.14) reject every child IngressRoute, and the chat routing depends on them ([traefik/traefik#14016](https://github.com/traefik/traefik/issues/14016)). See [`docs/known-issues.md`](docs/known-issues.md), which also lists the other issues found during testing.
+- **Traefik Hub is pinned to v3.21.3.** The chat routing needs Traefik Proxy v3.7.15 or later; see [`docs/known-issues.md`](docs/known-issues.md), which also lists the other issues found during testing.
 
 - **The vLLM model name is set in two places** (`vllm` and `traefik-ai-gateway`). Blueprint components cannot reference each other's values. vLLM also takes 90% of the GPU memory whatever the model size (`gpuMemoryUtilization: 0.90`); see [choosing the vLLM model](docs/prerequisites.md#51-choosing-the-vllm-model-for-your-gpu).
 - **Open WebUI must reach `ai.${DOMAIN}` and `keycloak.${DOMAIN}` from inside the cluster.** If your load balancer cannot route traffic from the cluster back to itself, set `open-webui.hostAliases` to the Traefik ClusterIP in the wizard.

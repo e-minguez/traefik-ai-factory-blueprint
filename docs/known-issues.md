@@ -1,177 +1,25 @@
 # Known issues
 
-## Traefik Proxy v3.7.14 rejects every child IngressRoute (Hub v3.20.14, v3.21.1)
+## Child IngressRoutes need Traefik Proxy v3.7.15 or later
 
-**Status:** confirmed upstream bug, fixed upstream but **not released yet**:
-[traefik/traefik#14016](https://github.com/traefik/traefik/issues/14016)
-(our report [#14032](https://github.com/traefik/traefik/issues/14032) is a
-duplicate of it), fix PR
-[#14018](https://github.com/traefik/traefik/pull/14018) merged into `v3.7`
-on 2026-10-12 (commit `51c1c3e6eb`). On 2026-10-13 the latest Traefik Proxy
-release was still v3.7.14, so the fix is expected in v3.7.15 and a Hub release
-built on it. **Workaround in this repository:** Traefik Hub is pinned to
-**v3.20.13** ([`cluster/traefik-helmchart.yaml`](../cluster/traefik-helmchart.yaml)).
+The chat API uses multi-layer routing: the parent IngressRoute
+(`chat-parent`) validates the Keycloak token and sets `X-Groups`, and the
+child routes (`chat-children`, attached with `parentRefs`) match on
+`X-Groups` and on the requested model. Traefik Proxy v3.7.14 rejected every
+child IngressRoute
+([traefik/traefik#14016](https://github.com/traefik/traefik/issues/14016)),
+so chat requests got a 404. Proxy v3.7.15 fixes it.
 
-| Traefik Hub | Traefik Proxy | Child IngressRoutes |
-|---|---|---|
-| v3.20.6 to v3.20.13 | v3.7.13 or older | work (v3.20.6 and v3.20.13 tested) |
-| v3.21.0 | v3.7.13 | should work (not tested) |
-| **v3.20.14, v3.21.1** | **v3.7.14** | **rejected** (both tested) |
+Affected Hub releases are the ones built on Proxy v3.7.14: v3.20.14, v3.20.15,
+v3.21.1 and v3.21.2. The blueprint pins Hub v3.21.3
+([`cluster/traefik-helmchart.yaml`](../cluster/traefik-helmchart.yaml)). If you
+pick another version, check that it ships Proxy v3.7.15 or later, then:
 
-The Proxy versions come from the Hub release notes. Traefik chart 41.6.1 and
-later default to an affected Hub version, so the chart's image tag is pinned.
-
-### Symptoms
-
-With an affected version:
-
-- `POST https://ai.${DOMAIN}/v1/chat/completions` returns **404** for every
-  caller, including requests without a token. The parent route never gets as
-  far as the JWT check.
-- The Traefik log repeats, with no further detail:
-
-  ```text
-  ERR error="building child routers muxer: no child routers could be added to muxer (5 skipped)"
-      routerName=traefik-ai-gateway-demo-system-chat-parent-...@kubernetescrd
-  ```
-
-- The middlewares of the child routes are fine: the same middlewares on a
-  top-level IngressRoute build without errors.
-
-### Why this breaks the blueprint
-
-The chat API uses multi-layer routing. The parent IngressRoute (`chat-parent`)
-validates the Keycloak token, and the `gateway-jwt` middleware sets the
-`X-Groups` header from it. The child routes (`chat-children`, attached with
-`parentRefs`) then match on `X-Groups` and on the requested model (`Model()`).
-Matching on a header that a middleware sets is only possible with child
-routes. Without them, nothing routes chat requests.
-
-### Root cause
-
-A regression in Traefik Proxy **v3.7.14**, from the upstream commit
-[`a39758f925`](https://github.com/traefik/traefik/commit/a39758f925) "Expose
-IngressRoute metadata in access logs" (2026-09-08), in how the Kubernetes CRD
-provider builds routers:
-
-1. **The CRD provider gives every IngressRoute router an observability block**,
-   child routes included, to carry ingress metadata
-   (`pkg/provider/kubernetes/crd/kubernetes_http.go`, v3.7 and `master`):
-
-   ```go
-   r := &dynamic.Router{
-       ...
-       ParentRefs:  parentRouterNames,
-       Observability: &dynamic.RouterObservabilityConfig{
-           Metadata: &dynamic.ObservabilityMetadata{
-               Ingress: buildIngressRouteMetadata(ingressRoute),
-           },
-       },
-   }
-   ```
-
-2. **The router manager rejects any child router with an observability block**
-   (`pkg/server/router/router.go`):
-
-   ```go
-   // Check for non-root router with Observability config.
-   if router.Observability != nil {
-       router.AddError(errors.New("non-root router cannot have Observability configuration"), true)
-       continue
-   }
-   ```
-
-3. **The rejected children are then skipped silently** when the parent's
-   child muxer is built (`buildChildRoutersMuxer`: `if len(childRouter.Err) > 0
-   { continue }`). That only logs the generic "no child routers could be added
-   to muxer" error.
-
-Before that commit (Traefik v3.6, and v3.7 up to v3.7.13), the provider only
-copied the route's own `observability` field (`Observability:
-route.Observability`), which is nil unless the IngressRoute sets it. The same
-check in `router.go` therefore passed. The default-observability code in `pkg/server/aggregator.go` already
-skips child routers on purpose ("Only root routers can have models applied"),
-so the behavior in v3.7 looks unintended.
-
-It does not depend on this chart. Any IngressRoute with `parentRefs` hits it
-on Traefik v3.7.14. The minimal reproduction below also failed on the cluster
-with Hub v3.20.14, without any middleware.
-
-### Minimal reproduction
-
-```yaml
-apiVersion: traefik.io/v1alpha1
-kind: IngressRoute
-metadata:
-  name: parent
-spec:
-  entryPoints: [web]
-  routes:
-    - kind: Rule
-      match: Host(`repro.example.com`)
----
-apiVersion: traefik.io/v1alpha1
-kind: IngressRoute
-metadata:
-  name: child
-spec:
-  parentRefs:
-    - name: parent
-  routes:
-    - kind: Rule
-      match: PathPrefix(`/`)
-      services:
-        - name: whoami
-          port: 80
+```shell
+./scripts/chat.sh none qwen2.5:0.5b hi        # must be 401 (JWT on the parent route), not 404
+kubectl -n traefik logs ds/traefik | grep 'no child routers could be added'   # must be empty
+./scripts/verify.sh
 ```
-
-- **Traefik Proxy v3.7.13 / Hub v3.20.13:** `curl -H 'Host: repro.example.com' http://<traefik>/` reaches `whoami`.
-- **Traefik Proxy v3.7.14 / Hub v3.20.14 or v3.21.1:** 404, and the log shows `no child routers could be added to muxer (1 skipped)`.
-
-### Checking whether a newer version fixes it
-
-Before moving the pin to a newer Hub version:
-
-1. Check the Hub release notes: the bundled Traefik Proxy must be v3.7.15 or
-   later (any release containing #14018). In the code, `pkg/server/router/router.go`
-   must have `!router.Observability.IsMetadataOnly()` in the non-root check.
-2. Or test on the cluster. Change `image.tag` in
-   `cluster/traefik-helmchart.yaml`, apply it, then:
-
-   ```shell
-   ./scripts/chat.sh none qwen2.5:0.5b hi        # must be 401 (JWT on the parent route), not 404
-   kubectl -n traefik logs ds/traefik | grep 'no child routers could be added'   # must be empty
-   ./scripts/verify.sh
-   ```
-
-### Consequences of the pin
-
-- `traefik-ai-gateway.aiMetrics.detailed` stays `false`. Detailed GenAI
-  metrics (`observability.metrics.level: detailed`) arrived in v3.21.
-  OpenTelemetry traces, metrics and access logs still work.
-- Everything else in the blueprint (AI gateway, MCP gateway, WAF, failover,
-  PII masking) is supported and was verified on v3.20.13.
-- Hub v3.21.0 (Proxy v3.7.13) should also be unaffected, and would bring
-  detailed metrics, but it was not tested.
-
-### Upstream issue
-
-Tracked in [traefik/traefik#14016](https://github.com/traefik/traefik/issues/14016)
-("Observability Metadata break non-root router", labelled
-`kind/bug/confirmed`, closed 2026-10-12). The change that introduced it is PR
-[#12985](https://github.com/traefik/traefik/pull/12985) (commit `a39758f925`).
-Our report, [#14032](https://github.com/traefik/traefik/issues/14032), is a
-duplicate with the Traefik Hub versions and a minimal reproduction.
-
-The fix, PR [#14018](https://github.com/traefik/traefik/pull/14018) "Allow
-observability metadata on child routers" (milestone 3.7, merged 2026-10-12),
-keeps the CRD provider as it is and relaxes the check in `router.go`: a child
-router may carry an `Observability` block that holds only `Metadata`
-(new `RouterObservabilityConfig.IsMetadataOnly()`). Access logs, metrics,
-tracing or trace verbosity on a child router are still rejected. This repository
-sets none of them on child IngressRoutes, so the fix covers the blueprint.
-Once a Hub release with Traefik Proxy v3.7.15+ is out, check it as described
-above and move the image pin in `cluster/traefik-helmchart.yaml`.
 
 ## Other issues found during testing
 
